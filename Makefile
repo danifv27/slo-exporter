@@ -1,76 +1,157 @@
-#!/usr/bin/make -f 
-SRC_DIR	:= $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
-TMP_DIR ?= $(SRC_DIR)/tmp
-TMP_BIN_DIR ?= $(TMP_DIR)/bin
+ifeq ($(V),1)
+  Q =
+  PROGRESS = --progress plain
+else
+  Q = @
+  PROGRESS = 
+endif
 
-GORELEASER_VERSION ?= v0.140.1
+# The binary to build (just the basename).
+BIN ?= slo_exporter
 
-$(TMP_DIR):
-	mkdir -p $(TMP_DIR)
+# This repo's root import path (under GOPATH).
+PKG := github.com/danifv27/slo-exporter
 
-$(TMP_BIN_DIR):
-	mkdir -p $(TMP_BIN_DIR)
+# Where to push the docker image.
+DOCKER_REGISTRY ?= docker.io
 
-GORELEASER ?= $(TMP_BIN_DIR)/goreleaser
-$(GORELEASER): $(TMP_BIN_DIR)
-	@echo "Downloading goreleaser version $(GORELEASER_VERSION) to $(TMP_BIN_DIR) ..."
-	@curl -sNL "https://github.com/goreleaser/goreleaser/releases/download/$(GORELEASER_VERSION)/goreleaser_Linux_x86_64.tar.gz" | tar -xzf - -C $(TMP_BIN_DIR)
+# Which architecture to build - see $(ALL_ARCH) for options.
+# if the 'local' rule is being run, detect the ARCH from 'go env'
+# if it wasn't specified by the caller.
+local : ARCH ?= $(shell go env GOOS)-$(shell go env GOARCH)
+ARCH ?= linux-amd64
 
-RELEASE_NOTES ?= $(TMP_DIR)/release_notes
-$(RELEASE_NOTES): $(TMP_DIR)
-	@echo "Generating release notes to $(RELEASE_NOTES) ..."
-	@csplit -q -n1 --suppress-matched -f $(TMP_DIR)/release-notes-part CHANGELOG.md '/## \[\s*v.*\]/' {1}
-	@mv $(TMP_DIR)/release-notes-part1 $(RELEASE_NOTES)
-	@rm $(TMP_DIR)/release-notes-part*
+REVISION:= $(shell echo $$(git rev-parse HEAD) ||echo "Unknown Revision")
 
-.PHONY: revive
-revive:
-	@echo "Downloading linter revive..."
-	go install github.com/mgechev/revive@v1.0.7
+BUILDINFO_TAG ?= $(shell echo $$(git describe --long --all | tr '/' '-')$$(git diff-index --quiet HEAD -- || echo '-dirty-'$$(git diff-index -u HEAD | openssl sha1 | cut -c 10-17)))
+VCS_TAG := $(shell git describe --tags)
+ifeq ($(VCS_TAG),)
+VCS_TAG := $(BUILDINFO_TAG)
+endif
+
+ifeq ($(VERSION),)
+VERSION := $(VCS_TAG)
+endif
+
+TAG_LATEST ?= false
+
+platform_temp = $(subst -, ,$(ARCH))
+GOOS = $(word 1, $(platform_temp))
+GOARCH = $(word 2, $(platform_temp))
+
+BASE64_PASSWORD_DANIFV27 = ZHVtbXlWYWx1ZQ==
+# timestamp value that is formatted according to the RFC3339 standard
+BUILD_DATE=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+# Set default base image dynamically for each arch
+ifeq ($(GOARCH),amd64)
+	DOCKERFILE ?= Dockerfile.$(BIN)
+endif
+
+GIT_COMMIT=$(shell git rev-parse HEAD)
+GIT_SHORT_COMMIT=$(shell git rev-parse --short HEAD)
+IMAGE_NAME = $(DOCKER_REGISTRY)/ebtpc-commons/$(BIN)
+IMAGE_NAME_LC = $(shell echo $(IMAGE_NAME) | tr A-Z a-z)
+
+VCS_USER ?= danifv27
+VCS_PASSWORD = $(shell echo $(BASE64_PASSWORD_DANIFV27) | base64 --decode)
+VCS_PROTOCOL ?= https
+VCS_URL ?= github.com/danifv27/slo-exporter.git
+VCS_REF:= $(shell git rev-parse HEAD)
+
+PHONY: init 
+init: ./go.mod ## Initialize the module
+
+./go.mod:
+	$(Q)go mod init $(PKG) && go mod tidy
 
 .PHONY: all
-all: lint test-and-coverage build
+all: test build
 
-.PHONY: lint
-lint: revive
-	revive -formatter friendly -config .revive.toml $(shell find $(SRC_DIR) -name "*.go" | grep -v "^$(SRC_DIR)/vendor/")
+# GNU make required targets declared as .PHONY to be explicit
+BUILD_PHONY_TARGETS = build-linux-amd64 build-darwin-amd64 build-windows-amd64
+.PHONY: $(BUILD_PHONY_TARGETS)
+$(BUILD_PHONY_TARGETS): build-%:
+	$(Q)$(MAKE) --no-print-directory ARCH=$* build
 
-SLO_EXPORTER_BIN ?= slo_exporter
-.PHONY: build
-build:
-	GOOS=$(OS) GOARCH=$(ARCH) CGO_ENABLED=0 go build -o $(SLO_EXPORTER_BIN) -a $(SRC_DIR)/cmd/slo_exporter.go
+PHONY: build
+build: output/$(GOOS)/$(GOARCH)/bin/$(BIN)
 
-.PHONY: docker-build
-docker: build
-	docker build -t slo_exporter .
+output/$(GOOS)/$(GOARCH)/bin/$(BIN): build-dirs
+	@echo "Building binary: $@ $(VERSION)"
+	GOOS=$(GOOS) \
+	GOARCH=$(GOARCH) \
+	VERSION=$(VERSION) \
+	PKG=$(PKG) \
+	BIN=$(BIN) \
+	OUTPUT_DIR=./output/$(GOOS)/$(GOARCH)/bin \
+	./scripts/build.sh
 
-.PHONY: e2e-test
-e2e-test: build
-	./test/run_tests.sh
+PHONY: local
+local: build-dirs ## Build application for the local arch
+	GOOS=$(GOOS) \
+	GOARCH=$(GOARCH) \
+	VERSION=$(VERSION) \
+	PKG=$(PKG) \
+	BIN=$(BIN) \
+	OUTPUT_DIR=$$(pwd)/output/$(GOOS)/$(GOARCH)/bin \
+	scripts/build.sh
 
-.PHONY: test
-test: $(TMP_DIR)
-	go test -v --race -coverprofile=$(TMP_DIR)/coverage.out $(shell go list $(SRC_DIR)/... | grep -v /vendor/)
+PHONY: build-dirs
+build-dirs:
+	@mkdir -p output/$(GOOS)/$(GOARCH)/bin
+	@mkdir -p .go/src/$(PKG) .go/pkg .go/bin .go/std/$(GOOS)/$(GOARCH) .go/go-build
 
-.PHONY: benchmark
-benchmark: clean
-	./scripts/benchmark.sh
-
-.PHONY: test-and-coverage
-test-and-coverage: test
-	go tool cover -func $(TMP_DIR)/coverage.out
-
-.PHONY: cross-build
-cross-build: $(GORELEASER)
-	$(GORELEASER) build --rm-dist
-
-.PHONY: release
-release: $(RELEASE_NOTES) $(GORELEASER)
-	@echo "Releasing new version do GitHub and DockerHub using goreleaser..."
-	$(GORELEASER) release --rm-dist --release-notes $(RELEASE_NOTES)
+CLEAN_PHONY_TARGETS = clean-linux-amd64 clean-darwin-amd64 clean-windows-amd64
+.PHONY: $(CLEAN_PHONY_TARGETS)
+$(CLEAN_PHONY_TARGETS): clean-%:
+	$(Q)$(MAKE) --no-print-directory ARCH=$* clean
 
 .PHONY: clean
-clean:
-	rm -rf dist $(TMP_DIR) $(SLO_EXPORTER_BIN)
-	find . -type f -name "*.pos" -prune -exec rm -f {} \;
-	find . -type d -name "test_output" -prune -exec rm -rf {} \;
+clean-%:
+	$(Q)$(MAKE) --no-print-directory ARCH=$* clean
+
+clean: ## Clean out all generated items
+	$(Q)echo "Cleaning binary: $(pwd)/output/$(GOOS)/$(GOARCH)/bin/${BIN}"
+	$(Q)test -e $$(pwd)/output/$(GOOS)/$(GOARCH)/bin/${BIN} || rm $$(pwd)/output/$(GOOS)/$(GOARCH)/bin/${BIN}
+
+.PHONY: coverage
+coverage: ## Generates the total code coverage of the project
+	$(Q)$(eval COVERAGE_DIR=$(shell mktemp -d))
+	$(Q)mkdir -p $(COVERAGE_DIR)/tmp
+	$(Q)for j in $$(go list ./... | grep -v '/vendor/' | grep -v '/ext/'); do go test -covermode=count -coverprofile=$(COVERAGE_DIR)/$$(basename $$j).out $$j > /dev/null 2>&1; done
+	$(Q)echo 'mode: count' > $(COVERAGE_DIR)/tmp/full.out
+	$(Q)tail -q -n +2 $(COVERAGE_DIR)/*.out >> $(COVERAGE_DIR)/tmp/full.out
+	$(Q)@go tool cover -func=$(COVERAGE_DIR)/tmp/full.out | tail -n 1 | sed -e 's/^.*statements)[[:space:]]*//' -e 's/%//'
+
+.PHONY: package
+package: ## Create a docker image of the project
+	@echo "Packaging image: $(VERSION) [$(GIT_COMMIT)]"
+	$(Q)docker build --no-cache --build-arg VCS_REF=$(GIT_COMMIT) --build-arg VERSION=$(VERSION) \
+	--build-arg NAME=$(BIN) --build-arg BUILD_DATE=$(BUILD_DATE) $(PROGRESS) \
+	-t $(IMAGE_NAME_LC):local -f $(DOCKERFILE) .
+
+.PHONY: tag
+tag: ## Tag image created by package with latest, git commit and version
+	@echo "Tagging image: ${VERSION} $(GIT_COMMIT)"
+	$(Q)docker tag $(IMAGE_NAME_LC):local $(IMAGE_NAME_LC):$(GIT_SHORT_COMMIT)
+	$(Q)docker tag $(IMAGE_NAME_LC):local $(IMAGE_NAME_LC):${VERSION}
+
+.PHONY: push
+push: tag ## Push tagged images to docker registry
+	@echo "Pushing docker image to registry: ${VERSION} $(GIT_SHORT_COMMIT)"
+#	$(Q)(echo $(BASE64_PASSWORD) | base64 --decode | docker login -u danifv27 --password-stdin $(DOCKER_REGISTRY))
+	$(Q)docker push $(IMAGE_NAME_LC):$(GIT_SHORT_COMMIT)
+	$(Q)docker push $(IMAGE_NAME_LC):${VERSION}
+#	$(Q)docker logout $(DOCKER_REGISTRY)
+
+.PHONY: help
+help: ## Show This Help
+	@for line in $$(cat Makefile | grep "##" | grep -v "grep" | sed  "s/:.*##/:/g" | sed "s/\ /!/g"); do verb=$$(echo $$line | cut -d ":" -f 1); desc=$$(echo $$line | cut -d ":" -f 2 | sed "s/!/\ /g"); printf "%-30s--%s\n" "$$verb" "$$desc"; done
+
+.PHONY: test
+test: unit_test ## Run all available tests
+
+.PHONY: unit_test
+unit_test: ## Run all available unit tests
+	go test -v $(shell go list ./... | grep -v /vendor/)
